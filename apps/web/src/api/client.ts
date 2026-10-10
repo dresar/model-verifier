@@ -218,6 +218,7 @@ export type ModelVerificationReport = {
   usage_evidence: Record<string, unknown>
   risk_signals: string[]
   cases: ModelVerificationCase[]
+  ai_verdict?: AiVerdictResult | null
 }
 
 export type ModelVerificationTemporaryModels = {
@@ -327,3 +328,95 @@ export async function createModelVerificationRun(payload: ModelVerificationRunPa
     }
   }
 }
+
+export type ProbeDefinition = {
+  id: string
+  title: string
+  dimension: string
+  prompt: string
+  repeat: number
+}
+
+export type ProbeDefinitionsResult = {
+  claimed_model: string
+  profile: {
+    id: string
+    label: string
+    description: string
+    required_dimensions: string[]
+    minimum_identity_score: number
+  }
+  cases: ProbeDefinition[]
+}
+
+export type SingleProbeCallPayload = {
+  base_url: string
+  api_key: string
+  model: string
+  prompt: string
+  provider_mode?: string
+  timeout_seconds?: number
+}
+
+export type SingleProbeCallResult = {
+  answer: string
+  latency_ms: number
+  error: string
+  upstream_model: string
+}
+
+export type ScoreCasePayload = {
+  case_id: string
+  answer: string
+  error?: string
+}
+
+export type ScoreCaseResult = {
+  id: string
+  score: number
+  status: string
+  reason: string
+  signals: string[]
+  matched?: string[]
+  missing?: string[]
+  forbidden?: string[]
+  expected_criteria?: string[]
+}
+
+export type AiVerdictPayload = {
+  claimed_model: string
+  actual_model?: string
+  cases: Array<{
+    id: string
+    title?: string
+    status?: string
+    answer?: string
+  }>
+}
+
+export type AiVerdictResult = {
+  auditor_model: string
+  ai_analysis: string
+  generated_at: string
+}
+
+export const getProbeDefinitions = (claimedModel: string) =>
+  api<ProbeDefinitionsResult>(`/api/probe-definitions?claimed_model=${encodeURIComponent(claimedModel)}`)
+
+export const callSingleProbe = (payload: SingleProbeCallPayload) =>
+  api<SingleProbeCallResult>('/api/probe-call', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+
+export const scoreSingleCase = (payload: ScoreCasePayload) =>
+  api<ScoreCaseResult>('/api/score-case', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+
+export const requestAiVerdict = (payload: AiVerdictPayload) =>
+  api<AiVerdictResult>('/api/ai-verdict', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })

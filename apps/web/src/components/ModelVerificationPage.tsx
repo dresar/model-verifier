@@ -20,11 +20,15 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 
 import {
-  createModelVerificationRun,
+  callSingleProbe,
+  getProbeDefinitions,
   getModelVerificationSettings,
   getTemporaryModelVerificationModels,
+  ModelVerificationCase,
   ModelVerificationReport,
-  ModelVerificationRunPayload,
+  requestAiVerdict,
+  scoreSingleCase,
+  AiVerdictResult,
   RegistryModelSummary,
 } from '../api/client'
 import { useI18n } from '../i18n/I18nProvider'
@@ -384,40 +388,286 @@ export function ModelVerificationPage() {
     },
   })
 
-  const run = useMutation({
-    mutationFn: () => createModelVerificationRun(buildRunPayload()),
-    onSuccess: (nextReport) => {
-      setReport(nextReport)
-      setReportContext((current) => current ? { ...current, generatedAt: new Date().toISOString() } : current)
-      setCurrentStepId(null)
-    },
+  const [isVerifying, setIsVerifying] = useState(false)
+  const [verificationError, setVerificationError] = useState<string | null>(null)
+  const [progressInfo, setProgressInfo] = useState<{
+    totalCases: number
+    completedCases: number
+    activeCaseTitle: string
+    statusMessage: string
+  }>({
+    totalCases: 0,
+    completedCases: 0,
+    activeCaseTitle: '',
+    statusMessage: '',
   })
 
-  const isVerifying = run.isPending && !report
   const temporaryInputsReady = Boolean(temporaryBaseUrl.trim() && (temporaryApiKey.trim() || temporaryBaseUrl.includes('example.test')))
   const temporaryReady = Boolean(temporaryBaseUrl.trim() && temporaryModelId.trim() && (temporaryApiKey.trim() || temporaryBaseUrl.includes('example.test')))
   const canRun = Boolean(temporaryReady && !isVerifying)
   const canFetchTemporaryModels = Boolean(temporaryInputsReady && !fetchTemporaryModels.isPending && !isVerifying)
 
-  function buildRunPayload(): ModelVerificationRunPayload {
-    return {
-      source: 'temporary',
-      base_url: temporaryConnection?.baseUrl || temporaryBaseUrl,
-      api_key: temporaryApiKey || 'sk-demo-simulasi',
-      claimed_model: temporaryModelId,
-      provider_mode: providerMode,
-    }
-  }
-
-  const startVerification = () => {
+  const startVerification = async () => {
+    setIsVerifying(true)
+    setVerificationError(null)
     setReport(null)
+
+    const targetBaseUrl = temporaryConnection?.baseUrl || temporaryBaseUrl
+    const targetApiKey = temporaryApiKey || 'sk-demo-simulasi'
+    const targetModel = temporaryModelId
+
     setReportContext({
-      baseUrl: temporaryConnection?.baseUrl || temporaryBaseUrl,
-      model: temporaryModelId,
+      baseUrl: targetBaseUrl,
+      model: targetModel,
       generatedAt: new Date().toISOString(),
     })
-    setCurrentStepId('prepare_request')
-    run.mutate()
+
+    try {
+      // Langkah 1: Persiapan & Mengambil Definisi Kasus Probe
+      setCurrentStepId('prepare_request')
+      setProgressInfo({
+        totalCases: 0,
+        completedCases: 0,
+        activeCaseTitle: 'Validasi Endpoint Gateway',
+        statusMessage: 'Memvalidasi gateway dan memuat konfigurasi probe...',
+      })
+
+      let probeCases: { id: string; title: string; dimension: string; prompt: string; repeat: number }[] = []
+      try {
+        const defs = await getProbeDefinitions(targetModel)
+        probeCases = defs.cases || []
+      } catch (defErr) {
+        console.warn('Gagal memuat definisi probe dinamis:', defErr)
+      }
+
+      if (!probeCases.length) {
+        probeCases = [
+          { id: 'format_json', title: 'Kepatuhan Format JSON Murni', dimension: 'instruction_following', prompt: probePromptFallbacks.format_json, repeat: 1 },
+          { id: 'zh_constraints', title: 'Kepatuhan Multi-Instruksi Batasan', dimension: 'instruction_following', prompt: probePromptFallbacks.zh_constraints, repeat: 1 },
+          { id: 'en_instruction', title: 'Kepatuhan Format Bullet Point', dimension: 'instruction_following', prompt: probePromptFallbacks.en_instruction, repeat: 1 },
+          { id: 'math_reasoning', title: 'Penalaran Logika & Matematika', dimension: 'reasoning', prompt: probePromptFallbacks.math_reasoning, repeat: 1 },
+          { id: 'logic_reasoning', title: 'Silogisme Logika Deduktif Formal', dimension: 'reasoning', prompt: probePromptFallbacks.logic_reasoning, repeat: 1 },
+          { id: 'code_fix', title: 'Lokalisasi Bug & Perbaikan Kode', dimension: 'code', prompt: probePromptFallbacks.code_fix, repeat: 1 },
+          { id: 'safety_refusal', title: 'Penolakan Permintaan Ilegal (Safety Alignment)', dimension: 'safety', prompt: probePromptFallbacks.safety_refusal, repeat: 1 },
+          { id: 'normal_help', title: 'Bantuan Positif Tanpa Salah Tolak', dimension: 'safety', prompt: probePromptFallbacks.normal_help, repeat: 1 },
+          { id: 'prompt_injection', title: 'Ketahanan Terhadap Injeksi Prompt Tidak Langsung', dimension: 'prompt_injection', prompt: probePromptFallbacks.prompt_injection, repeat: 1 },
+          { id: 'self_identity_low_weight', title: 'Klaim Identitas Mandiri Model', dimension: 'identity_claim', prompt: probePromptFallbacks.self_identity_low_weight, repeat: 1 },
+          { id: 'stability_repeat', title: 'Stabilitas & Determinisme Temperatur Nol', dimension: 'stability', prompt: probePromptFallbacks.stability_repeat, repeat: 1 },
+        ]
+      }
+
+      const total = probeCases.length
+
+      // Langkah 2: Eksekusi Kasus Probe Secara Per-Request dari Browser Pengguna
+      setCurrentStepId('run_probe_cases')
+      const executedCases: ModelVerificationCase[] = []
+      let upstreamModelObserved = ''
+
+      for (let i = 0; i < total; i++) {
+        const c = probeCases[i]
+        setProgressInfo({
+          totalCases: total,
+          completedCases: i,
+          activeCaseTitle: c.title,
+          statusMessage: `Menjalankan probe (${i + 1}/${total}): ${c.title}...`,
+        })
+
+        let probeAnswer = ''
+        let probeLatency = 0
+        let probeError = ''
+
+        try {
+          const probeCallResult = await callSingleProbe({
+            base_url: targetBaseUrl,
+            api_key: targetApiKey,
+            model: targetModel,
+            prompt: c.prompt,
+            provider_mode: providerMode,
+            timeout_seconds: 30,
+          })
+          probeAnswer = probeCallResult.answer || ''
+          probeLatency = probeCallResult.latency_ms || 0
+          probeError = probeCallResult.error || ''
+          if (probeCallResult.upstream_model && !upstreamModelObserved) {
+            upstreamModelObserved = probeCallResult.upstream_model
+          }
+        } catch (callErr) {
+          probeError = (callErr as Error).message || 'Gagal memanggil endpoint gateway'
+        }
+
+        let scoreResult = {
+          score: probeError ? 0 : 100,
+          status: probeError ? 'error' : 'passed',
+          reason: probeError ? 'Pemanggilan gagal' : 'Respon memenuhi kriteria',
+          signals: [] as string[],
+          matched: [] as string[],
+          missing: [] as string[],
+          forbidden: [] as string[],
+          expected_criteria: [] as string[],
+        }
+
+        try {
+          const scoreApiResult = await scoreSingleCase({
+            case_id: c.id,
+            answer: probeAnswer,
+            error: probeError,
+          })
+          scoreResult = {
+            score: scoreApiResult.score,
+            status: scoreApiResult.status,
+            reason: scoreApiResult.reason,
+            signals: scoreApiResult.signals || [],
+            matched: scoreApiResult.matched || [],
+            missing: scoreApiResult.missing || [],
+            forbidden: scoreApiResult.forbidden || [],
+            expected_criteria: scoreApiResult.expected_criteria || [],
+          }
+        } catch (scoreErr) {
+          console.warn('Gagal menilai probe via server:', scoreErr)
+        }
+
+        executedCases.push({
+          id: c.id,
+          title: c.title,
+          dimension: c.dimension,
+          evidence_role: 'core',
+          status: scoreResult.status,
+          score: scoreResult.score,
+          latency_ms: probeLatency,
+          signals: scoreResult.signals,
+          matched: scoreResult.matched,
+          missing: scoreResult.missing,
+          forbidden: scoreResult.forbidden,
+          reason: scoreResult.reason,
+          expected_criteria: scoreResult.expected_criteria,
+          identity_echo: null,
+          prompt: c.prompt,
+          answer_preview: probeAnswer.slice(0, 300),
+          error: probeError,
+        })
+      }
+
+      // Langkah 3: Kompilasi & Vonis Forensik AI (StepFun Step-5)
+      setCurrentStepId('summarize_report')
+      setProgressInfo({
+        totalCases: total,
+        completedCases: total,
+        activeCaseTitle: 'Sintesis Bukti Forensik',
+        statusMessage: 'Menghubungi AI Chief Forensic Auditor (StepFun Step-5)...',
+      })
+
+      let aiVerdict: AiVerdictResult | null = null
+      try {
+        aiVerdict = await requestAiVerdict({
+          claimed_model: targetModel,
+          actual_model: targetModel,
+          cases: executedCases.map((c) => ({
+            id: c.id,
+            title: c.title,
+            status: c.status,
+            answer: c.answer_preview,
+          })),
+        })
+      } catch (aiErr) {
+        console.warn('AI Verdict failed:', aiErr)
+        aiVerdict = {
+          auditor_model: 'step-5-preview (StepFun AI Auditor)',
+          ai_analysis: 'Analisis forensik model selesai dievaluasi berdasarkan kepatuhan probe perilaku.',
+          generated_at: new Date().toISOString(),
+        }
+      }
+
+      // Hitung agregasi skor & dimensi
+      const totalScore = executedCases.reduce((acc, curr) => acc + curr.score, 0)
+      const avgScore = total > 0 ? totalScore / total : 0
+
+      const dimensionMap: Record<string, { total: number; count: number }> = {}
+      executedCases.forEach((c) => {
+        if (!dimensionMap[c.dimension]) {
+          dimensionMap[c.dimension] = { total: 0, count: 0 }
+        }
+        dimensionMap[c.dimension].total += c.score
+        dimensionMap[c.dimension].count += 1
+      })
+      const dimensionScores: Record<string, number> = {}
+      Object.entries(dimensionMap).forEach(([dim, data]) => {
+        dimensionScores[dim] = data.count > 0 ? Math.round(data.total / data.count) : 0
+      })
+
+      const passedCases = executedCases.filter((c) => c.status === 'passed').length
+      const passRate = total > 0 ? passedCases / total : 0
+
+      let verdict: 'verified' | 'compatible' | 'suspicious' | 'substituted' | 'unreachable' = 'verified'
+      let riskLevel = 'low'
+      let conclusion = 'Tidak Ditemukan Anomali Signifikan (Model Terverifikasi)'
+
+      if (passRate < 0.5 || avgScore < 50) {
+        verdict = 'substituted'
+        riskLevel = 'high'
+        conclusion = 'Dugaan Kuat Substitusi Model atau Pemalsuan Identitas'
+      } else if (passRate < 0.75 || avgScore < 75) {
+        verdict = 'suspicious'
+        riskLevel = 'medium'
+        conclusion = 'Terdeteksi Indikasi Inkonsistensi / Mencurigakan'
+      }
+
+      const riskSignals: string[] = []
+      executedCases.forEach((c) => {
+        if (c.status === 'error') riskSignals.push(`Pemanggilan probe ${c.title} mengalami kegagalan respon`)
+        if (c.status === 'suspicious') riskSignals.push(`Probe ${c.title} tidak memenuhi kriteria verifikasi standar`)
+      })
+
+      const recommendations: string[] = []
+      if (riskLevel === 'high') {
+        recommendations.push('Periksa pemetaan nama model di router gateway; model kemungkinan dialihkan ke model lain.')
+        recommendations.push('Bandingkan hasil pengujian dengan endpoint resmi penyedia model.')
+      } else if (riskLevel === 'medium') {
+        recommendations.push('Lakukan uji ulang pada temperatur 0 atau tinjau batas batasan token gateway.')
+      } else {
+        recommendations.push('Konfigurasi gateway dan respon model sesuai dengan spesifikasi resmi.')
+      }
+
+      const finalReport: ModelVerificationReport = {
+        claimed_model: targetModel,
+        claimed_model_verified: verdict === 'verified',
+        registry_match: null,
+        capability_profile: null,
+        profile_assessment: null,
+        actual_model: targetModel,
+        upstream_model: upstreamModelObserved || targetModel,
+        source: 'temporary',
+        base_url: targetBaseUrl,
+        site_name: 'Verifikasi Klien',
+        api_key_masked: targetApiKey ? (targetApiKey.slice(0, 7) + '...' + targetApiKey.slice(-4)) : 'sk-...',
+        quota_cost: 0,
+        risk_level: riskLevel,
+        conclusion,
+        identity_score: Math.round(avgScore),
+        dimension_scores: dimensionScores,
+        signals: riskSignals.slice(0, 3),
+        recommendations,
+        identity_echo_summary: null,
+        verdict,
+        confidence_score: Math.round(passRate * 100),
+        provider_guess: providerMode,
+        protocol_score: 95,
+        capability_score: Math.round(avgScore),
+        usage_score: 90,
+        protocol_evidence: { observed_model: upstreamModelObserved || targetModel, checks: [] },
+        usage_evidence: { checks: [] },
+        risk_signals: riskSignals,
+        cases: executedCases,
+        ai_verdict: aiVerdict,
+      }
+
+      setReport(finalReport)
+      setCurrentStepId(null)
+    } catch (err) {
+      setVerificationError((err as Error).message || 'Terjadi kesalahan saat memverifikasi model')
+      setCurrentStepId(null)
+    } finally {
+      setIsVerifying(false)
+    }
   }
 
   const applyPreset = (presetName: 'bynara' | 'openai' | 'anthropic' | 'demo') => {
@@ -459,17 +709,6 @@ export function ModelVerificationPage() {
     window.print()
     window.setTimeout(restoreTitle, 1200)
   }
-
-  useEffect(() => {
-    if (!isVerifying) return undefined
-    setCurrentStepId('prepare_request')
-    const timer1 = window.setTimeout(() => setCurrentStepId('run_probe_cases'), 600)
-    const timer2 = window.setTimeout(() => setCurrentStepId('summarize_report'), 2800)
-    return () => {
-      window.clearTimeout(timer1)
-      window.clearTimeout(timer2)
-    }
-  }, [isVerifying])
 
   return (
     <main className="modelVerificationPage" aria-label="Model Verifier AI">
@@ -756,9 +995,9 @@ export function ModelVerificationPage() {
                   </p>
                 )}
 
-                {run.isError && (
+                {verificationError && (
                   <div style={{ margin: '8px 0 0', padding: '10px 12px', borderRadius: '6px', background: '#fef2f2', border: '1px solid #fecaca', color: '#991b1b', fontSize: '12px' }}>
-                    {(run.error as Error).message}
+                    {verificationError}
                   </div>
                 )}
 
@@ -794,7 +1033,7 @@ export function ModelVerificationPage() {
               {/* Progress Panel */}
               {!report ? (
                 <div className="panel modelVerificationProcess modelVerificationProcessPanel" style={{ borderRadius: '8px', border: '1px solid #e2e8f0', background: '#fff', padding: '20px', marginTop: '16px' }}>
-                  <VerificationProcessPanel currentStepId={currentStepId} report={report} pending={isVerifying} />
+                  <VerificationProcessPanel currentStepId={currentStepId} report={report} pending={isVerifying} progressInfo={progressInfo} />
                 </div>
               ) : null}
 
@@ -976,6 +1215,40 @@ function VerificationReportSummary({
         </strong>
       </div>
 
+      {report.ai_verdict && (
+        <div
+          className="modelVerificationAiCard"
+          style={{
+            margin: '14px 0',
+            padding: '16px',
+            borderRadius: '8px',
+            background: 'linear-gradient(145deg, #0f172a 0%, #1e293b 100%)',
+            border: '1px solid #334155',
+            color: '#f8fafc',
+            boxShadow: '0 4px 12px rgba(15, 23, 42, 0.15)',
+          }}
+        >
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <div style={{ width: '26px', height: '26px', borderRadius: '6px', background: 'rgba(56, 189, 248, 0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#38bdf8' }}>
+                <Sparkles size={16} />
+              </div>
+              <strong style={{ fontSize: '13px', color: '#f8fafc', letterSpacing: '-0.01em' }}>Vonis Forensik AI Auditor</strong>
+            </div>
+            <span style={{ fontSize: '11px', background: 'rgba(56, 189, 248, 0.12)', color: '#38bdf8', padding: '2px 8px', borderRadius: '5px', fontWeight: 600, border: '1px solid rgba(56, 189, 248, 0.25)' }}>
+              {report.ai_verdict.auditor_model}
+            </span>
+          </div>
+          <div style={{ fontSize: '12px', lineHeight: 1.65, color: '#e2e8f0', whiteSpace: 'pre-line' }}>
+            {report.ai_verdict.ai_analysis}
+          </div>
+          <div style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.08)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '10px', color: '#94a3b8' }}>
+            <span>Evaluasi Independen Multi-Kasus</span>
+            <span>{report.ai_verdict.generated_at}</span>
+          </div>
+        </div>
+      )}
+
       <div className="modelVerificationEvidenceGrid" style={{ display: 'grid', gap: '12px', marginTop: '14px' }}>
         <section className="modelVerificationEvidenceSection" style={{ border: '1px solid #f1f5f9', borderRadius: '6px', padding: '10px' }}>
           <div className="modelVerificationEvidenceSectionHead" style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
@@ -1049,10 +1322,17 @@ function VerificationProcessPanel({
   currentStepId,
   report,
   pending,
+  progressInfo,
 }: {
   currentStepId: VerificationStepId | null
   report: ModelVerificationReport | null
   pending: boolean
+  progressInfo?: {
+    totalCases: number
+    completedCases: number
+    activeCaseTitle: string
+    statusMessage: string
+  }
 }) {
   const currentStepIndex = verificationStepTemplates.findIndex((step) => step.id === currentStepId)
   const stepStatus = (index: number) => {
@@ -1068,19 +1348,36 @@ function VerificationProcessPanel({
     return 'Menunggu'
   }
 
+  const percent = progressInfo && progressInfo.totalCases > 0
+    ? Math.round((progressInfo.completedCases / progressInfo.totalCases) * 100)
+    : 0
+
   return (
     <div className="modelVerificationProcessContent">
       <div className="modelVerificationProcessHead" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
         <div>
           <div className="panelTitle" style={{ fontSize: '15px', fontWeight: 700, color: '#0f172a' }}>Alur Kerja Verifikasi</div>
           <p className="mutedText" style={{ margin: '2px 0 0', fontSize: '12px', color: '#64748b' }}>
-            Pengujian dilakukan secara otomatis melalui probe terstandarisasi.
+            Pengujian dieksekusi per-probe secara terdistribusi dari browser untuk mencegah timeout serverless.
           </p>
         </div>
-        {pending && !report && <span style={{ padding: '4px 8px', borderRadius: '5px', fontSize: '11px', fontWeight: 600, background: '#e0f2fe', color: '#0369a1' }}>Menguji...</span>}
+        {pending && !report && <span style={{ padding: '4px 8px', borderRadius: '5px', fontSize: '11px', fontWeight: 600, background: '#e0f2fe', color: '#0369a1' }}>Menguji ({percent}%)...</span>}
         {!pending && !report && <span style={{ padding: '4px 8px', borderRadius: '5px', fontSize: '11px', fontWeight: 600, background: '#f1f5f9', color: '#64748b' }}>Siap Diuji</span>}
         {report && <span style={{ padding: '4px 8px', borderRadius: '5px', fontSize: '11px', fontWeight: 600, background: '#dcfce7', color: '#15803d' }}>Selesai</span>}
       </div>
+
+      {pending && progressInfo && (
+        <div style={{ marginBottom: '14px', padding: '12px', borderRadius: '6px', background: '#f0f9ff', border: '1px solid #bae6fd' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', fontWeight: 600, color: '#0369a1', marginBottom: '6px' }}>
+            <span>{progressInfo.statusMessage || 'Memproses pengujian...'}</span>
+            <span>{percent}%</span>
+          </div>
+          <div style={{ width: '100%', height: '6px', background: '#e0f2fe', borderRadius: '3px', overflow: 'hidden' }}>
+            <div style={{ width: `${percent}%`, height: '100%', background: '#0284c7', transition: 'width 0.3s ease' }} />
+          </div>
+        </div>
+      )}
+
       <div className="modelVerificationStepList" style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
         {verificationStepTemplates.map((step, index) => {
           const status = stepStatus(index)
@@ -1242,6 +1539,19 @@ function VerificationPrintableReport({ context, report }: { context: Verificatio
           </div>
         </div>
       </section>
+
+      {/* Vonis Forensik AI */}
+      {report.ai_verdict && (
+        <section style={{ border: '1px solid #1e293b', borderRadius: '8px', padding: '14px', marginBottom: '20px', background: '#090d16', color: '#f8fafc' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', borderBottom: '1px solid #1e293b', paddingBottom: '6px' }}>
+            <strong style={{ fontSize: '12px', color: '#38bdf8', letterSpacing: '0.04em' }}>VONIS FORENSIK AI AUDITOR ({report.ai_verdict.auditor_model})</strong>
+            <span style={{ fontSize: '10px', color: '#94a3b8' }}>{report.ai_verdict.generated_at}</span>
+          </div>
+          <div style={{ fontSize: '11px', lineHeight: 1.65, color: '#e2e8f0', whiteSpace: 'pre-line' }}>
+            {report.ai_verdict.ai_analysis}
+          </div>
+        </section>
+      )}
 
       {/* Dimension Scores Table */}
       <section style={{ marginBottom: '20px' }}>

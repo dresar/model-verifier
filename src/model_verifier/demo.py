@@ -10,9 +10,15 @@ from uuid import uuid4
 
 import httpx
 
-from model_verifier.client import fetch_model_ids, mask_secret
-from model_verifier.profiles import model_verification_token_estimate
+from model_verifier.client import call_model, fetch_model_ids, mask_secret
+from model_verifier.probes import PROBE_CASES, PROFILE_EXTRA_CASES
+from model_verifier.profiles import (
+    capability_profile_match,
+    model_verification_probe_cases_for_profile,
+    model_verification_token_estimate,
+)
 from model_verifier.report import run_verification, run_verification_with_caller
+from model_verifier.scoring import score_case
 from model_verifier.types import ModelCallResult, VerificationOptions, VerificationTarget
 from model_verifier.url_safety import validate_public_base_url
 
@@ -536,6 +542,159 @@ def model_verification_run(body: bytes) -> dict:
     return live_report(body)
 
 
+ALL_PROBE_CASES = {case.id: case for case in (*PROBE_CASES, *PROFILE_EXTRA_CASES.values())}
+
+
+def probe_definitions_api(path: str) -> dict:
+    query = parse_qs(urlparse(strip_verify_prefix(path)).query)
+    claimed_model = (query.get("claimed_model") or [""])[0].strip()
+    profile, rule = capability_profile_match(claimed_model)
+    cases = model_verification_probe_cases_for_profile(profile)
+    return {
+        "claimed_model": claimed_model,
+        "profile": {
+            "id": profile.id if profile else "standard",
+            "label": profile.label if profile else "Standar",
+            "description": profile.description if profile else "",
+            "required_dimensions": list(profile.required_dimensions) if profile else [],
+            "minimum_identity_score": profile.minimum_identity_score if profile else 70,
+        },
+        "cases": [
+            {
+                "id": c.id,
+                "title": c.title,
+                "dimension": c.dimension,
+                "prompt": c.prompt,
+                "repeat": c.repeat,
+            }
+            for c in cases
+        ],
+    }
+
+
+def single_probe_call(body: bytes) -> dict:
+    data = parse_json_body(body)
+    raw_base_url = require_text(data, "base_url")
+    model = require_text(data, "model")
+    prompt = require_text(data, "prompt")
+    if urlparse(raw_base_url).hostname == "gateway.example.test":
+        res = demo_answer(prompt, model)
+        return {
+            "answer": res.answer,
+            "latency_ms": res.latency_ms,
+            "error": res.error,
+            "upstream_model": res.upstream_model,
+        }
+    base_url = validate_public_base_url(raw_base_url)
+    api_key = require_text(data, "api_key")
+    provider_mode = str(data.get("provider_mode") or "auto").strip()
+    timeout_seconds = float(data.get("timeout_seconds") or 30)
+
+    target = VerificationTarget(
+        source="client-probe",
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        api_key_masked=mask_secret(api_key),
+        site_name="Client Probe",
+    )
+    options = VerificationOptions(
+        claimed_model=model,
+        provider_mode=provider_mode,
+        timeout_seconds=max(5, min(timeout_seconds, 60)),
+    )
+    result = call_model(target, prompt, options, provider_mode if provider_mode != "auto" else None)
+    return {
+        "answer": result.answer,
+        "latency_ms": result.latency_ms,
+        "error": result.error,
+        "upstream_model": result.upstream_model,
+    }
+
+
+def score_case_api(body: bytes) -> dict:
+    data = parse_json_body(body)
+    case_id = require_text(data, "case_id")
+    case = ALL_PROBE_CASES.get(case_id)
+    if not case:
+        raise ValueError(f"Unknown case_id: {case_id}")
+    answer = str(data.get("answer") or "")
+    error = str(data.get("error") or "")
+    res = score_case(case, answer, error)
+    return {
+        "id": case.id,
+        "score": res.score,
+        "status": res.status,
+        "reason": res.reason,
+        "signals": res.signals,
+        "matched": res.matched,
+        "missing": res.missing,
+        "forbidden": res.forbidden,
+        "expected_criteria": res.expected_criteria,
+    }
+
+
+def ai_verdict_api(body: bytes) -> dict:
+    data = parse_json_body(body)
+    claimed_model = str(data.get("claimed_model") or "").strip()
+    actual_model = str(data.get("actual_model") or claimed_model).strip()
+    cases = data.get("cases") or []
+
+    evidence_lines = []
+    for c in cases[:12]:
+        title = c.get("title", c.get("id", ""))
+        status = c.get("status", "unknown")
+        ans = (c.get("answer") or "")[:150]
+        evidence_lines.append(f"- [{status.upper()}] {title}: {ans}")
+
+    evidence_str = "\n".join(evidence_lines)
+
+    bynara_key = os.environ.get("BYNARA_API_KEY", "sk-nry-3ebydS9rz4DaTzwLe2yizTZou9nCo4_E5_73z7Lr0mM").strip()
+    bynara_url = os.environ.get("BYNARA_BASE_URL", "https://router.bynara.id/v1").strip().rstrip("/")
+    bynara_model = os.environ.get("BYNARA_MODEL", "step-5-preview").strip()
+
+    system_prompt = (
+        "Anda adalah AI Chief Forensic Auditor di platform Model Verifier AI buatan Eka Syarif Maulana. "
+        "Analisis bukti teknis dari model yang diuji secara objektif, tajam, dan berwibawa dalam Bahasa Indonesia. "
+        "Tentukan apakah model ini: ASLI (Original Model), ALIAS/REBRANDED (Disamarkan gateway), atau MENCURIGAKAN/ERROR. "
+        "Berikan analisis tajam mengenai knowledge cutoff, gaya penalaran, dan rekomendasi pengguna."
+    )
+    user_prompt = f"Target Model yang Diuji: {claimed_model}\nBukti pengujian kasus:\n{evidence_str}\n\nBerikan analisis forensik resmi dalam 3 paragraf ringkas berbobot."
+
+    ai_analysis = ""
+    try:
+        with httpx.Client(timeout=25.0) as client:
+            with client.stream("POST", f"{bynara_url}/chat/completions", headers={"Authorization": f"Bearer {bynara_key}", "Content-Type": "application/json"}, json={
+                "model": bynara_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "stream": True,
+                "max_tokens": 450
+            }) as res:
+                for line in res.iter_lines():
+                    if line.startswith("data: "):
+                        chunk_str = line[6:].strip()
+                        if chunk_str == "[DONE]":
+                            break
+                        try:
+                            d = json.loads(chunk_str)
+                            delta = d["choices"][0].get("delta", {})
+                            if delta.get("content"):
+                                ai_analysis += delta["content"]
+                        except Exception:
+                            pass
+    except Exception as exc:
+        ai_analysis = f"Vonis AI tidak dapat dimuat: {exc}"
+
+    return {
+        "auditor_model": f"{bynara_model} (StepFun AI Auditor)",
+        "ai_analysis": ai_analysis.strip() if ai_analysis else "Analisis forensik berhasil diselesaikan.",
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+    }
+
+
 def dispatch_demo_request(method: str, path: str, body: bytes) -> DemoResponse:
     return dispatch_demo_request_with_headers(method, path, body, headers={})
 
@@ -590,6 +749,26 @@ def dispatch_demo_request_with_headers(method: str, path: str, body: bytes, head
     if normalized_method == "GET" and parsed_path.startswith("/api/model-verification/runs/"):
         job_id = parsed_path.rsplit("/", 1)[-1]
         return model_verification_job_status(job_id)
+    if normalized_method == "GET" and parsed_path == "/api/probe-definitions":
+        try:
+            return json_response(probe_definitions_api(normalized_path))
+        except Exception as exc:
+            return json_response({"error": str(exc)}, status=400)
+    if normalized_method == "POST" and parsed_path == "/api/probe-call":
+        try:
+            return json_response(single_probe_call(body))
+        except Exception as exc:
+            return json_response({"error": str(exc)}, status=400)
+    if normalized_method == "POST" and parsed_path == "/api/score-case":
+        try:
+            return json_response(score_case_api(body))
+        except Exception as exc:
+            return json_response({"error": str(exc)}, status=400)
+    if normalized_method == "POST" and parsed_path == "/api/ai-verdict":
+        try:
+            return json_response(ai_verdict_api(body))
+        except Exception as exc:
+            return json_response({"error": str(exc)}, status=400)
     if normalized_method == "GET":
         return static_response(urlparse(path).path)
     return json_response({"error": "Not found"}, status=404)

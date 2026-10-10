@@ -366,3 +366,56 @@ def test_verify_root_serves_demo_page():
 
     assert response.status == 200
     assert "/verify/" in html
+
+
+def test_probe_definitions_endpoint():
+    response = dispatch_demo_request("GET", "/api/probe-definitions?claimed_model=gpt-5.6-luna", b"")
+    assert response.status == 200
+    data = decode_json(response.body)
+    assert data["claimed_model"] == "gpt-5.6-luna"
+    assert len(data["cases"]) >= 10
+    assert any(c["id"] == "format_json" for c in data["cases"])
+
+
+def test_single_probe_call_demo_simulation():
+    body = json.dumps({
+        "base_url": "https://gateway.example.test",
+        "api_key": "sk-test",
+        "model": "gpt-4.1",
+        "prompt": "只输出 JSON：{\"status\":\"ok\",\"n\":3}，不要输出其他文字。",
+    }).encode("utf-8")
+    response = dispatch_demo_request("POST", "/api/probe-call", body)
+    assert response.status == 200
+    data = decode_json(response.body)
+    assert data["answer"] != ""
+    assert data["error"] == ""
+    assert data["upstream_model"] == "gpt-4.1"
+
+
+def test_score_case_endpoint():
+    body = json.dumps({
+        "case_id": "format_json",
+        "answer": '{"status":"ok","n":3}',
+        "error": "",
+    }).encode("utf-8")
+    response = dispatch_demo_request("POST", "/api/score-case", body)
+    assert response.status == 200
+    data = decode_json(response.body)
+    assert data["id"] == "format_json"
+    assert data["status"] == "passed"
+    assert data["score"] == 100
+
+
+def test_ai_verdict_endpoint():
+    body = json.dumps({
+        "claimed_model": "gpt-5.6-luna",
+        "cases": [
+            {"id": "format_json", "title": "JSON", "status": "passed", "answer": '{"status":"ok"}'}
+        ],
+    }).encode("utf-8")
+    response = dispatch_demo_request("POST", "/api/ai-verdict", body)
+    assert response.status == 200
+    data = decode_json(response.body)
+    assert "auditor_model" in data
+    assert "ai_analysis" in data
+
