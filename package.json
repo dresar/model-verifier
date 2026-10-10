@@ -1,0 +1,13 @@
+{
+  "name": "model-verifier",
+  "version": "1.0.0",
+  "description": "Platform Verifikasi Keaslian & Black-Box Probing Model AI oleh Eka Syarif Maulana",
+  "author": "Eka Syarif Maulana <eka.ckp16799@gmail.com>",
+  "homepage": "https://github.com/dresar/model-verifier",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "build": "npm --prefix apps/web run build",
+    "dev": "npm --prefix apps/web run dev",
+    "lint": "npm --prefix apps/web run lint"
+  }
+}

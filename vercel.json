@@ -1,0 +1,36 @@
+{
+  "version": 2,
+  "framework": "vite",
+  "buildCommand": "npm run build",
+  "outputDirectory": "apps/web/dist",
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.py?path=$1"
+    },
+    {
+      "source": "/verify/api/(.*)",
+      "destination": "/api/index.py?path=$1"
+    },
+    {
+      "source": "/verify/assets/(.*)",
+      "destination": "/assets/$1"
+    },
+    {
+      "source": "/verify/brand/(.*)",
+      "destination": "/brand/$1"
+    },
+    {
+      "source": "/verify/fonts/(.*)",
+      "destination": "/fonts/$1"
+    },
+    {
+      "source": "/verify/(.*)",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}

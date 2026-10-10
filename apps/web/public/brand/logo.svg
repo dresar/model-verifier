@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Model Verifier AI">
+  <rect x="16" y="16" width="96" height="96" rx="28" fill="#FFFFFF" stroke="#0A0A0A" stroke-width="10"/>
+  <path d="M42 82V48l22 20 22-20v34" fill="none" stroke="#0A0A0A" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="42" cy="46" r="8" fill="#0A0A0A"/>
+  <circle cx="64" cy="68" r="8" fill="#0A0A0A"/>
+  <circle cx="86" cy="46" r="8" fill="#0A0A0A"/>
+</svg>
